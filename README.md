@@ -1,23 +1,26 @@
 # seehand
 
-Eyes and hands for an AI coding agent on a Linux X11 desktop, plus a text-only web debugger.
+Eyes and hands for an AI coding agent on a Linux desktop (X11 or wlroots Wayland), plus a text-only web debugger.
 
 One CLI. Every command prints short plain text, so an agent can read the screen and act on it without burning tokens on screenshots.
 
 - **Desktop:** reads any app's widgets through the AT-SPI accessibility tree, clicks buttons and fills fields through their accessibility actions, falls back to XTEST mouse/keyboard and screenshots when an app draws its own UI.
 - **Web:** drives a Chromium browser over the Chrome DevTools Protocol: console errors, failed requests, DOM, JS eval, page screenshots.
 
-Requires X11. Wayland sessions are not supported. Web commands need Chrome, Chromium or Brave (native or flatpak). Firefox removed CDP and cannot be used.
+Works on X11 and on wlroots-based Wayland compositors (sway, Hyprland, river, dwl, labwc, niri). GNOME and KDE Wayland do not expose the needed protocols: there only the accessibility and web commands work. Web commands need Chrome, Chromium or Brave (native or flatpak). Firefox removed CDP and cannot be used.
 
 ## Install
 
 ```sh
 # Arch/Artix: pacman -S python-gobject at-spi2-core
 # Debian/Ubuntu: apt install python3-gi gir1.2-atspi-2.0
+# Wayland (wlroots) also: grim wtype wlrctl
 git clone https://github.com/vladbiber/seehand && cd seehand
 ./install.sh          # venv + ~/.local/bin/seehand
 seehand help
 ```
+
+On Wayland, screenshots and input go through [grim](https://gitlab.freedesktop.org/emersion/grim), [wtype](https://github.com/atx/wtype) and [wlrctl](https://git.sr.ht/~brocellous/wlrctl). Install them from your distro, or build each with `meson setup build --prefix ~/.local && ninja -C build install`. seehand picks Wayland when `WAYLAND_DISPLAY` is set; force a backend with `SEEHAND_BACKEND=x11` or `wayland`.
 
 Apps only expose their widgets when accessibility is on. GTK and Qt apps usually do; Chromium/Electron apps need `--force-renderer-accessibility`.
 
@@ -46,7 +49,7 @@ seehand key ctrl+s Return
 seehand run "pavucontrol"
 ```
 
-Screenshots go to `~/.cache/seehand/`.
+Screenshots go to `~/.cache/seehand/`. On Wayland, coordinates are in the compositor's logical layout, `drag` is not supported yet, and widget positions from `info` may be relative to the window.
 
 ## Web
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-seehand: eyes and hands for an AI agent on an X11 desktop, plus a text-only web debugger.
+seehand: eyes and hands for an AI agent on an X11 or wlroots Wayland desktop, plus a text-only web debugger.
 Terse output, accessibility first, few tokens.
 
 DESKTOP (cheap, text-first — prefer these):
@@ -196,31 +196,87 @@ def _BTN(n):
     from pynput.mouse import Button
     return {'l': Button.left, 'r': Button.right, 'm': Button.middle}[n.lower()[0]]
 
+def _wl():
+    b = os.environ.get('SEEHAND_BACKEND')
+    if b: return b == 'wayland'
+    return bool(os.environ.get('WAYLAND_DISPLAY'))
+
+def _need(tool):
+    from shutil import which
+    if not which(tool):
+        sys.exit(f'seehand: Wayland needs {tool} (wlroots compositors). See README.')
+    return tool
+
+def _wsh(*args):
+    r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode: sys.exit(f'seehand: {args[0]}: {r.stderr.strip() or "failed"}')
+
+_WL_BTN = {'l': 'left', 'r': 'right', 'm': 'middle'}
+_WL_MOD = {'ctrl': 'ctrl', 'control': 'ctrl', 'alt': 'alt', 'shift': 'shift',
+           'super': 'logo', 'win': 'logo', 'cmd': 'logo', 'altgr': 'altgr'}
+_WL_KEY = {'enter': 'Return', 'return': 'Return', 'esc': 'Escape', 'escape': 'Escape',
+           'tab': 'Tab', 'space': 'space', 'backspace': 'BackSpace', 'delete': 'Delete',
+           'del': 'Delete', 'home': 'Home', 'end': 'End', 'pageup': 'Prior',
+           'pagedown': 'Next', 'up': 'Up', 'down': 'Down', 'left': 'Left', 'right': 'Right'}
+
+def _wl_move(x, y):
+    w = _need('wlrctl')
+    _wsh(w, 'pointer', 'move', '-100000', '-100000')
+    if x or y: _wsh(w, 'pointer', 'move', str(x), str(y))
+
+def _wl_key(combo):
+    parts = combo.split('+'); mods = [_WL_MOD.get(m.lower(), m.lower()) for m in parts[:-1]]
+    k = parts[-1]; k = _WL_KEY.get(k.lower(), k.upper() if k.lower()[:1] == 'f' and k[1:].isdigit() else k)
+    args = [_need('wtype')]
+    for m in mods: args += ['-M', m]
+    args += ['-k', k]
+    for m in reversed(mods): args += ['-m', m]
+    _wsh(*args)
+
 def c_shot(a):
-    import mss
     from PIL import Image
     out = a.out or os.path.join(SHOTS, f's-{int(time.time())}.png')
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    with mss.MSS() as s:
-        mon = {'left': a.region[0], 'top': a.region[1], 'width': a.region[2], 'height': a.region[3]} if a.region else s.monitors[1]
-        raw = s.grab(mon)
-        img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
+    if _wl():
+        args = [_need('grim')]
+        if a.region: args += ['-g', f'{a.region[0]},{a.region[1]} {a.region[2]}x{a.region[3]}']
+        _wsh(*args, out)
+        img = Image.open(out)
+    else:
+        import mss
+        with mss.MSS() as s:
+            mon = {'left': a.region[0], 'top': a.region[1], 'width': a.region[2], 'height': a.region[3]} if a.region else s.monitors[1]
+            raw = s.grab(mon)
+            img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
     if a.scale and a.scale != 1.0:
         img = img.resize((int(img.width * a.scale), int(img.height * a.scale)))
     img.save(out); print(out)
 
-def c_move(a): m = _mouse(); m.position = (a.x, a.y); print(f'{a.x} {a.y}')
+def c_move(a):
+    if _wl(): _wl_move(a.x, a.y)
+    else: m = _mouse(); m.position = (a.x, a.y)
+    print(f'{a.x} {a.y}')
 def c_click(a):
+    if _wl():
+        if a.x is not None: _wl_move(a.x, a.y); time.sleep(.03)
+        for _ in range(2 if a.d else 1): _wsh(_need('wlrctl'), 'pointer', 'click', _WL_BTN[a.b.lower()[0]])
+        print('ok'); return
     m = _mouse()
     if a.x is not None: m.position = (a.x, a.y); time.sleep(.03)
     m.click(_BTN(a.b), 2 if a.d else 1); print('ok')
 def c_drag(a):
+    if _wl(): sys.exit('seehand: drag is not supported on Wayland yet')
     m = _mouse(); b = _BTN(a.b)
     m.position = (a.x1, a.y1); time.sleep(.05); m.press(b); time.sleep(.05)
     m.position = (a.x2, a.y2); time.sleep(.05); m.release(b); print('ok')
-def c_scroll(a): _mouse().scroll(a.dx, a.dy); print('ok')
+def c_scroll(a):
+    if _wl(): _wsh(_need('wlrctl'), 'pointer', 'scroll', str(-a.dy * 15), str(a.dx * 15))
+    else: _mouse().scroll(a.dx, a.dy)
+    print('ok')
 def c_type(a):
-    from pynput.keyboard import Controller; Controller().type(a.text); print(f'{len(a.text)}c')
+    if _wl(): _wsh(_need('wtype'), '--', a.text)
+    else: from pynput.keyboard import Controller; Controller().type(a.text)
+    print(f'{len(a.text)}c')
 _KEYMAP = None
 def _key(tok):
     global _KEYMAP
@@ -236,6 +292,9 @@ def _key(tok):
     if t.startswith('f') and t[1:].isdigit(): return getattr(Key, t)
     return tok
 def c_key(a):
+    if _wl():
+        for combo in a.combos: _wl_key(combo); time.sleep(.02)
+        print('ok'); return
     from pynput.keyboard import Controller
     kb = Controller()
     for combo in a.combos:
