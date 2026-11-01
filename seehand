@@ -211,18 +211,71 @@ def _wsh(*args):
     r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode: sys.exit(f'seehand: {args[0]}: {r.stderr.strip() or "failed"}')
 
-_WL_BTN = {'l': 'left', 'r': 'right', 'm': 'middle'}
+class _VPtr:
+    """Minimal Wayland client for zwlr_virtual_pointer_v1, spoken directly on the socket.
+    Every move ends with a zero motion: dwl-based compositors pick the surface before moving."""
+    BTN = {'l': 0x110, 'r': 0x111, 'm': 0x112}
+    def __init__(self):
+        import socket, struct
+        self.st = struct
+        d = os.environ['WAYLAND_DISPLAY']
+        path = d if d.startswith('/') else os.path.join(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'), d)
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); self.s.connect(path)
+        self.buf = b''; self.next = 2
+        reg = self._new(); self._req(1, 1, 'u', reg)
+        globs = {}
+        self._sync(lambda oid, op, body: oid == reg and op == 0 and globs.update([self._global(body)]))
+        if 'zwlr_virtual_pointer_manager_v1' not in globs:
+            sys.exit('seehand: compositor has no wlr virtual pointer (wlroots only)')
+        mgr = self._new()
+        self._req(reg, 0, 'usuu', globs['zwlr_virtual_pointer_manager_v1'], 'zwlr_virtual_pointer_manager_v1', 1, mgr)
+        self.p = self._new(); self._req(mgr, 0, 'uu', 0, self.p)
+    def _new(self):
+        self.next += 1; return self.next - 1
+    def _req(self, oid, op, sig, *args):
+        body = b''
+        for t, v in zip(sig, args):
+            if t == 's':
+                e = v.encode() + b'\0'; body += self.st.pack('<I', len(e)) + e + b'\0' * (-len(e) % 4)
+            else:
+                body += self.st.pack('<i' if t == 'i' else '<I', v)
+        self.s.sendall(self.st.pack('<II', oid, (8 + len(body)) << 16 | op) + body)
+    def _global(self, body):
+        name, n = self.st.unpack_from('<II', body)
+        return body[8:8 + n - 1].decode(), name
+    def _sync(self, on_event=lambda *a: None):
+        cb = self._new(); self._req(1, 0, 'u', cb)
+        while True:
+            while len(self.buf) < 8 or len(self.buf) < (self.st.unpack_from('<I', self.buf, 4)[0] >> 16):
+                chunk = self.s.recv(65536)
+                if not chunk: sys.exit('seehand: Wayland connection closed')
+                self.buf += chunk
+            oid, x = self.st.unpack_from('<II', self.buf); size, op = x >> 16, x & 0xffff
+            body, self.buf = self.buf[8:size], self.buf[size:]
+            if oid == 1 and op == 0: sys.exit(f'seehand: Wayland error: {body[12:-1].decode(errors="replace")}')
+            if oid == cb and op == 0: return
+            on_event(oid, op, body)
+    def _t(self): return int(time.monotonic() * 1000) & 0xffffffff
+    def rel(self, dx, dy):
+        self._req(self.p, 0, 'uii', self._t(), int(dx * 256), int(dy * 256)); self._req(self.p, 4, '')
+    def to(self, x, y):
+        self.rel(-100000, -100000); self.rel(x, y); self.rel(0, 0)
+    def button(self, b, down):
+        self._req(self.p, 2, 'uuu', self._t(), self.BTN[b.lower()[0]], 1 if down else 0); self._req(self.p, 4, '')
+    def scroll(self, dy, dx):
+        for axis, v in ((0, dy), (1, dx)):
+            if v:
+                self._req(self.p, 5, 'u', 1); self._req(self.p, 3, 'uui', self._t(), axis, int(v * 256))
+        self._req(self.p, 4, '')
+    def done(self):
+        self._req(self.p, 8, ''); self._sync(); self.s.close()
+
 _WL_MOD = {'ctrl': 'ctrl', 'control': 'ctrl', 'alt': 'alt', 'shift': 'shift',
            'super': 'logo', 'win': 'logo', 'cmd': 'logo', 'altgr': 'altgr'}
 _WL_KEY = {'enter': 'Return', 'return': 'Return', 'esc': 'Escape', 'escape': 'Escape',
            'tab': 'Tab', 'space': 'space', 'backspace': 'BackSpace', 'delete': 'Delete',
            'del': 'Delete', 'home': 'Home', 'end': 'End', 'pageup': 'Prior',
            'pagedown': 'Next', 'up': 'Up', 'down': 'Down', 'left': 'Left', 'right': 'Right'}
-
-def _wl_move(x, y):
-    w = _need('wlrctl')
-    _wsh(w, 'pointer', 'move', '-100000', '-100000')
-    if x or y: _wsh(w, 'pointer', 'move', str(x), str(y))
 
 def _wl_key(combo):
     parts = combo.split('+'); mods = [_WL_MOD.get(m.lower(), m.lower()) for m in parts[:-1]]
@@ -253,24 +306,29 @@ def c_shot(a):
     img.save(out); print(out)
 
 def c_move(a):
-    if _wl(): _wl_move(a.x, a.y)
+    if _wl(): v = _VPtr(); v.to(a.x, a.y); v.done()
     else: m = _mouse(); m.position = (a.x, a.y)
     print(f'{a.x} {a.y}')
 def c_click(a):
     if _wl():
-        if a.x is not None: _wl_move(a.x, a.y); time.sleep(.03)
-        for _ in range(2 if a.d else 1): _wsh(_need('wlrctl'), 'pointer', 'click', _WL_BTN[a.b.lower()[0]])
-        print('ok'); return
+        v = _VPtr()
+        if a.x is not None: v.to(a.x, a.y)
+        for _ in range(2 if a.d else 1): v.button(a.b, True); v.button(a.b, False)
+        v.done(); print('ok'); return
     m = _mouse()
     if a.x is not None: m.position = (a.x, a.y); time.sleep(.03)
     m.click(_BTN(a.b), 2 if a.d else 1); print('ok')
 def c_drag(a):
-    if _wl(): sys.exit('seehand: drag is not supported on Wayland yet')
+    if _wl():
+        v = _VPtr(); v.to(a.x1, a.y1); v._sync(); time.sleep(.05); v.button(a.b, True); v._sync(); time.sleep(.05)
+        for i in range(1, 11):
+            v.rel((a.x2 - a.x1) / 10, (a.y2 - a.y1) / 10); v.rel(0, 0); v._sync(); time.sleep(.01)
+        v.button(a.b, False); v.done(); print('ok'); return
     m = _mouse(); b = _BTN(a.b)
     m.position = (a.x1, a.y1); time.sleep(.05); m.press(b); time.sleep(.05)
     m.position = (a.x2, a.y2); time.sleep(.05); m.release(b); print('ok')
 def c_scroll(a):
-    if _wl(): _wsh(_need('wlrctl'), 'pointer', 'scroll', str(-a.dy * 15), str(a.dx * 15))
+    if _wl(): v = _VPtr(); v.scroll(-a.dy * 15, a.dx * 15); v.done()
     else: _mouse().scroll(a.dx, a.dy)
     print('ok')
 def c_type(a):

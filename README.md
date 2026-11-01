@@ -14,13 +14,13 @@ Works on X11 and on wlroots-based Wayland compositors (sway, Hyprland, river, dw
 ```sh
 # Arch/Artix: pacman -S python-gobject at-spi2-core
 # Debian/Ubuntu: apt install python3-gi gir1.2-atspi-2.0
-# Wayland (wlroots) also: grim wtype wlrctl
+# Wayland (wlroots) also: grim wtype
 git clone https://github.com/vladbiber/seehand && cd seehand
 ./install.sh          # venv + ~/.local/bin/seehand
 seehand help
 ```
 
-On Wayland, screenshots and input go through [grim](https://gitlab.freedesktop.org/emersion/grim), [wtype](https://github.com/atx/wtype) and [wlrctl](https://git.sr.ht/~brocellous/wlrctl). Install them from your distro, or build each with `meson setup build --prefix ~/.local && ninja -C build install`. seehand picks Wayland when `WAYLAND_DISPLAY` is set; force a backend with `SEEHAND_BACKEND=x11` or `wayland`.
+On Wayland, screenshots go through [grim](https://gitlab.freedesktop.org/emersion/grim) and typing through [wtype](https://github.com/atx/wtype); the mouse is driven directly over the wlr virtual pointer protocol, no extra tool. Install them from your distro, or build each with `meson setup build --prefix ~/.local && ninja -C build install`. seehand picks Wayland when `WAYLAND_DISPLAY` is set; force a backend with `SEEHAND_BACKEND=x11` or `wayland`.
 
 Apps only expose their widgets when accessibility is on. GTK and Qt apps usually do; Chromium/Electron apps need `--force-renderer-accessibility`.
 
@@ -49,7 +49,7 @@ seehand key ctrl+s Return
 seehand run "pavucontrol"
 ```
 
-Screenshots go to `~/.cache/seehand/`. On Wayland, coordinates are in the compositor's logical layout, `drag` is not supported yet, and widget positions from `info` may be relative to the window.
+Screenshots go to `~/.cache/seehand/`. On Wayland, coordinates are in the compositor's logical layout and widget positions from `info` may be relative to the window.
 
 ## Web
 
