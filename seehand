@@ -1,0 +1,637 @@
+#!/usr/bin/env python3
+"""
+seehand: eyes and hands for an AI agent on an X11 desktop, plus a text-only web debugger.
+Terse output, accessibility first, few tokens.
+
+DESKTOP (cheap, text-first — prefer these):
+  apps                                 list accessible applications
+  tree  [--app A] [--depth N] [--all]  widget tree (default: named+actionable only)
+  find  TEXT [--app A] [--role R]       search widgets by visible text
+  do    PATH|--name TEXT [--action N]   trigger a widget's action (click w/o mouse)
+  set   PATH|--name TEXT  VALUE         set an editable field's text (no keyboard)
+  info  PATH                            details of one widget
+
+DESKTOP (pixels/raw input — fallback when a11y is blind):
+  shot  [--scale F] [--region X Y W H] [--out P]    screenshot -> PNG path
+  move X Y | click [X Y] [-b L|R|M] [-d] | drag X1 Y1 X2 Y2 [-b L]
+  scroll DY [--dx D] | type TEXT | key COMBO [COMBO ...]
+  run "CMD"                            launch a GUI app detached
+
+WEB DEBUG via Chrome DevTools Protocol (cheap, text — attach to a browser
+launched with --remote-debugging-port):
+  web-launch [URL] [--browser B] [--keep]     start a Chromium browser w/ debugging
+                                              (auto-frees the port; flatpak Chrome ok)
+  web-login  [--yes] [--browser B] [--profile 'Profile 1']            sign the debug browser in AS YOU: decrypts
+                                              your real profile's cookies + injects them
+                                              via CDP. No --yes => prints a warning only.
+                                              Does NOT touch/close your real browser.
+  web-kill   [--browser B] [--port P]          tear down the debug browser cleanly
+  web-load   URL [--ms N] [--all]              navigate + capture console+network on load
+  web-tabs   [--port P]                        list open tabs (id title url)
+  web-eval   "JS" [--tab ID] [--port P]        run JS in the page, print result
+  web-log    [--ms 2500] [--tab ID] [--all]    console msgs (errors/warns default)
+  web-net    [--ms 2500] [--tab ID] [--all]    network (failed/4xx/5xx default)
+  web-dom    [--sel CSS] [--tab ID]            outerHTML or matched elements' text
+  web-shot   [--out P] [--tab ID]              page screenshot via CDP
+
+PATH = index path from `tree`/`find`, e.g. 1/0/3. Use --name to match by text.
+"""
+import argparse, json, os, subprocess, sys, time
+
+SHOTS = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'seehand')
+
+# ----------------------------------------------------------------------------- desktop a11y
+def _atspi():
+    import warnings; warnings.filterwarnings('ignore', category=DeprecationWarning)
+    import gi; gi.require_version('Atspi', '2.0')
+    from gi.repository import Atspi
+    Atspi.init()
+    return Atspi
+
+def _desktop():
+    return _atspi().get_desktop(0)
+
+def _node(path):
+    cur = _desktop()
+    for p in [x for x in path.split('/') if x != '']:
+        cur = cur.get_child_at_index(int(p))
+    return cur
+
+def _approot(name):
+    d = _desktop()
+    for i in range(d.get_child_count()):
+        a = d.get_child_at_index(i)
+        if a and (a.get_name() or '') == name:
+            return a, i
+    for i in range(d.get_child_count()):
+        a = d.get_child_at_index(i)
+        if a and name.lower() in (a.get_name() or '').lower():
+            return a, i
+    sys.exit(f'app not found: {name}')
+
+def _actions(o):
+    try:
+        return [o.get_action_name(i) for i in range(o.get_n_actions())]
+    except Exception:
+        return []
+
+def _ext(o):
+    A = _atspi()
+    try:
+        r = o.get_extents(A.CoordType.SCREEN)
+        return (r.x, r.y, r.width, r.height) if r.width else None
+    except Exception:
+        return None
+
+def _editable(o):
+    A = _atspi()
+    try:
+        return o.get_state_set().contains(A.StateType.EDITABLE)
+    except Exception:
+        return False
+
+def _label(o):
+    try: role = o.get_role_name()
+    except Exception: role = '?'
+    try: name = o.get_name() or ''
+    except Exception: name = ''
+    acts = _actions(o)
+    a = f' act={",".join(acts)}' if acts else ''
+    e = _ext(o); g = f' @{e[0]},{e[1]}' if e else ''
+    t = ''
+    try:
+        if role in ('text', 'entry', 'password text'):
+            s = o.get_text(0, -1)
+            if s: t = f' ={s[:50]!r}'
+    except Exception: pass
+    return f'[{role}] {name!r}{t}{a}{g}'
+
+def _walk(o, path, depth, maxd, show_all, out):
+    keep = show_all or (o.get_name() or '') or _actions(o) or _editable(o)
+    if keep:
+        out.append('  ' * path.count('/') + f'{path} ' + _label(o))
+    if depth >= maxd: return
+    try: n = o.get_child_count()
+    except Exception: n = 0
+    for i in range(n):
+        try: c = o.get_child_at_index(i)
+        except Exception: continue
+        if c: _walk(c, f'{path}/{i}', depth + 1, maxd, show_all, out)
+
+def _search(o, base, text, role, hits):
+    try: name, rn = (o.get_name() or ''), (o.get_role_name() or '')
+    except Exception: name, rn = '', ''
+    if text.lower() in name.lower() and (not role or role.lower() in rn.lower()):
+        hits.append((base, o))
+    try: n = o.get_child_count()
+    except Exception: n = 0
+    for i in range(n):
+        try: c = o.get_child_at_index(i)
+        except Exception: continue
+        if c: _search(c, f'{base}/{i}', text, role, hits)
+
+def _resolve(a):
+    if getattr(a, 'name', None):
+        hits = []
+        if getattr(a, 'app', None):
+            root, idx = _approot(a.app); _search(root, str(idx), a.name, None, hits)
+        else:
+            d = _desktop()
+            for i in range(d.get_child_count()):
+                _search(d.get_child_at_index(i), str(i), a.name, None, hits)
+        if not hits: sys.exit(f'no widget named: {a.name}')
+        return hits[0][1], hits[0][0]
+    return _node(a.path), a.path
+
+def c_apps(a):
+    d = _desktop()
+    for i in range(d.get_child_count()):
+        x = d.get_child_at_index(i)
+        print(f'{i} {x.get_name()!r} children={x.get_child_count()}')
+
+def c_tree(a):
+    out = []
+    if a.app:
+        root, idx = _approot(a.app); _walk(root, str(idx), 0, a.depth, a.all, out)
+    else:
+        d = _desktop()
+        for i in range(d.get_child_count()):
+            _walk(d.get_child_at_index(i), str(i), 0, a.depth, a.all, out)
+    print('\n'.join(out) if out else '(empty)')
+
+def c_find(a):
+    hits = []
+    if a.app:
+        root, idx = _approot(a.app); _search(root, str(idx), a.text, a.role, hits)
+    else:
+        d = _desktop()
+        for i in range(d.get_child_count()):
+            _search(d.get_child_at_index(i), str(i), a.text, a.role, hits)
+    if not hits: print('(no matches)'); return
+    for p, o in hits[:60]: print(f'{p} ' + _label(o))
+
+def c_do(a):
+    o, p = _resolve(a); names = _actions(o)
+    if not names: sys.exit(f'{p} has no actions')
+    idx = 0
+    if a.action:
+        idx = next((i for i, n in enumerate(names) if a.action.lower() in n.lower()), None)
+        if idx is None: sys.exit(f'action {a.action!r} not in {names}')
+    print(f'do {names[idx]!r} on {p} -> {o.do_action(idx)}')
+
+def c_set(a):
+    o, p = _resolve(a)
+    try: print(f'set {p} -> {o.set_text_contents(a.value)}')
+    except Exception as e: sys.exit(f'cannot set {p}: {e}')
+
+def c_info(a):
+    o = _node(a.path)
+    print(f'role={o.get_role_name()} name={o.get_name()!r}')
+    print(f'actions={_actions(o)} extents={_ext(o)} children={o.get_child_count()}')
+
+# ----------------------------------------------------------------------------- desktop input/screen
+def _mouse():
+    from pynput.mouse import Controller; return Controller()
+def _BTN(n):
+    from pynput.mouse import Button
+    return {'l': Button.left, 'r': Button.right, 'm': Button.middle}[n.lower()[0]]
+
+def c_shot(a):
+    import mss
+    from PIL import Image
+    out = a.out or os.path.join(SHOTS, f's-{int(time.time())}.png')
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with mss.MSS() as s:
+        mon = {'left': a.region[0], 'top': a.region[1], 'width': a.region[2], 'height': a.region[3]} if a.region else s.monitors[1]
+        raw = s.grab(mon)
+        img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
+    if a.scale and a.scale != 1.0:
+        img = img.resize((int(img.width * a.scale), int(img.height * a.scale)))
+    img.save(out); print(out)
+
+def c_move(a): m = _mouse(); m.position = (a.x, a.y); print(f'{a.x} {a.y}')
+def c_click(a):
+    m = _mouse()
+    if a.x is not None: m.position = (a.x, a.y); time.sleep(.03)
+    m.click(_BTN(a.b), 2 if a.d else 1); print('ok')
+def c_drag(a):
+    m = _mouse(); b = _BTN(a.b)
+    m.position = (a.x1, a.y1); time.sleep(.05); m.press(b); time.sleep(.05)
+    m.position = (a.x2, a.y2); time.sleep(.05); m.release(b); print('ok')
+def c_scroll(a): _mouse().scroll(a.dx, a.dy); print('ok')
+def c_type(a):
+    from pynput.keyboard import Controller; Controller().type(a.text); print(f'{len(a.text)}c')
+_KEYMAP = None
+def _key(tok):
+    global _KEYMAP
+    from pynput.keyboard import Key
+    if _KEYMAP is None:
+        _KEYMAP = {'ctrl':Key.ctrl,'control':Key.ctrl,'alt':Key.alt,'shift':Key.shift,
+            'super':Key.cmd,'win':Key.cmd,'cmd':Key.cmd,'enter':Key.enter,'return':Key.enter,
+            'esc':Key.esc,'escape':Key.esc,'tab':Key.tab,'space':Key.space,'backspace':Key.backspace,
+            'delete':Key.delete,'del':Key.delete,'home':Key.home,'end':Key.end,'pageup':Key.page_up,
+            'pagedown':Key.page_down,'up':Key.up,'down':Key.down,'left':Key.left,'right':Key.right}
+    t = tok.lower()
+    if t in _KEYMAP: return _KEYMAP[t]
+    if t.startswith('f') and t[1:].isdigit(): return getattr(Key, t)
+    return tok
+def c_key(a):
+    from pynput.keyboard import Controller
+    kb = Controller()
+    for combo in a.combos:
+        parts = combo.split('+'); mods = [_key(p) for p in parts[:-1]]; fin = _key(parts[-1])
+        for mod in mods: kb.press(mod)
+        kb.press(fin); kb.release(fin)
+        for mod in reversed(mods): kb.release(mod)
+        time.sleep(.02)
+    print('ok')
+def c_run(a):
+    env = dict(os.environ); env.setdefault('DISPLAY', ':0')
+    p = subprocess.Popen(a.cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+    print(f'pid {p.pid}')
+
+# ----------------------------------------------------------------------------- web (CDP)
+def _http_json(port, path):
+    import requests
+    return requests.get(f'http://127.0.0.1:{port}{path}', timeout=4).json()
+
+def _pages(port):
+    return [t for t in _http_json(port, '/json') if t.get('type') == 'page']
+
+def _pick(port, tab):
+    ps = _pages(port)
+    if tab: ps = [t for t in ps if t['id'] == tab]
+    if not ps: sys.exit(f'no page target on port {port} (is the browser up with --remote-debugging-port={port}?)')
+    return ps[0]
+
+class _Sess:
+    def __init__(self, url):
+        import websocket
+        self.ws = websocket.create_connection(url, max_size=None, timeout=8, suppress_origin=True)
+        self._id = 0; self.buf = []   # events seen while awaiting a call response are buffered, not dropped
+    def call(self, method, **params):
+        self._id += 1; mid = self._id
+        self.ws.send(json.dumps({'id': mid, 'method': method, 'params': params}))
+        while True:
+            m = json.loads(self.ws.recv())
+            if m.get('id') == mid:
+                if 'error' in m: raise RuntimeError(m['error'].get('message', m['error']))
+                return m.get('result', {})
+            if m.get('method'): self.buf.append(m)
+    def listen(self, seconds):
+        out, self.buf = self.buf, []; self.ws.settimeout(0.4); end = time.time() + seconds
+        while time.time() < end:
+            try:
+                m = json.loads(self.ws.recv())
+                if m.get('method'): out.append(m)
+            except Exception: continue
+        return out
+    def close(self):
+        try: self.ws.close()
+        except Exception: pass
+
+def _free_port(port, profile_tag):
+    """Reliably tear down a prior debug browser: kill the :port listener + any
+    process using our debug profile, then wait until the port is actually free."""
+    import re, signal
+    me = os.getpid()
+    for _ in range(8):
+        pids = set()
+        try:
+            out = subprocess.run(['ss', '-ltnp'], capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                if f':{port} ' in line or f':{port}\t' in line:
+                    pids.update(re.findall(r'pid=(\d+)', line))
+        except Exception:
+            pass
+        for d in os.listdir('/proc'):
+            if not d.isdigit() or int(d) == me:
+                continue
+            try:
+                with open(f'/proc/{d}/cmdline', 'rb') as f:
+                    cl = f.read().replace(b'\0', b' ').decode('utf-8', 'ignore')
+                if profile_tag in cl:
+                    pids.add(d)
+            except Exception:
+                continue
+        listening = f':{port}' in subprocess.run(['ss', '-ltn'], capture_output=True, text=True).stdout
+        if not pids and not listening:
+            return True
+        for p in pids:
+            try: os.kill(int(p), signal.SIGKILL)
+            except Exception: pass
+        time.sleep(1.2)
+    return False
+
+def c_web_kill(a):
+    print('freed' if _free_port(a.port, f'cc-{a.browser}-debug') else 'port still bound')
+
+def _resolve_browser(name):
+    """Return ('native', path) or ('flatpak', appid). Chromium-family only for CDP."""
+    from shutil import which
+    natives = {'chrome': ['google-chrome-stable','google-chrome','chromium','chromium-browser','brave','brave-browser'],
+               'chromium': ['chromium','chromium-browser'], 'brave': ['brave','brave-browser']}.get(name, [name])
+    for c in natives:
+        if which(c): return ('native', which(c))
+    if which('flatpak'):
+        for appid in {'chrome': ['com.google.Chrome'], 'chromium': ['org.chromium.Chromium'],
+                      'brave': ['com.brave.Browser']}.get(name, []):
+            import subprocess as sp
+            if sp.run(['flatpak', 'info', appid], stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode == 0:
+                return ('flatpak', appid)
+    sys.exit(f'no Chromium-family browser found for {name!r} (CDP needs Chrome/Chromium/Brave)')
+
+LOGIN_WARNING = """\
+⚠️  web-login — copies your REAL {browser} session into the debug browser
+  • It reads your logged-in cookies from your real {browser} profile, decrypts
+    them, and injects them into the debug browser on port {port}. After this you
+    (and whatever drives seehand) are signed in AS YOU — Google/YouTube, etc.
+  • The agent can then act AS YOU on any site you're logged into (post, comment,
+    buy, send). Your real {browser} is NOT touched or closed.
+To proceed, re-run with --yes:  seehand web-login --yes"""
+
+def _real_profile_dir(kind, ref, browser):
+    """Absolute path of the browser's real (logged-in) user-data dir."""
+    cfg = {'com.google.Chrome': 'google-chrome', 'org.chromium.Chromium': 'chromium',
+           'com.brave.Browser': 'BraveSoftware/Brave-Browser'}
+    if kind == 'flatpak':
+        return os.path.expanduser(f'~/.var/app/{ref}/config/{cfg.get(ref, "google-chrome")}')
+    native = {'chrome': 'google-chrome', 'chromium': 'chromium', 'brave': 'BraveSoftware/Brave-Browser'}
+    return os.path.expanduser(f'~/.config/{native.get(browser, "google-chrome")}')
+
+def _cookies_db(profile_dir, profile='Default'):
+    """Chrome keeps cookies at <profile>/Network/Cookies (modern) or <profile>/Cookies (legacy)."""
+    for rel in (f'{profile}/Network/Cookies', f'{profile}/Cookies'):
+        p = os.path.join(profile_dir, rel)
+        if os.path.exists(p):
+            return p
+    return None
+
+def _read_decrypt_cookies(db_path):
+    """Return [{name,value,domain,path,secure,httpOnly,sameSite,expires}] from a Chrome
+    cookie DB. Decrypts v10 cookies with the basic-store key ('peanuts'); v11 (keyring)
+    cookies (keyring-encrypted) are skipped. Strips the 32-byte
+    SHA256(host) domain-bind prefix that Chrome M104+ prepends to the plaintext."""
+    import sqlite3, hashlib, shutil, tempfile
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError:
+        sys.exit("web-login needs the 'cryptography' module: "
+                 "pip install cryptography")
+    key = hashlib.pbkdf2_hmac('sha1', b'peanuts', b'saltysalt', 1, 16)
+    def dec(enc, host):
+        if not enc:
+            return ''
+        if enc[:3] != b'v10':            # v11 = keyring-encrypted (no keyring here) -> can't decrypt
+            try: return enc.decode('utf-8')
+            except Exception: return None
+        d = Cipher(algorithms.AES(key), modes.CBC(b' ' * 16)).decryptor()
+        pt = d.update(enc[3:]) + d.finalize()
+        if pt: pt = pt[:-pt[-1]]          # strip PKCS7 padding
+        if len(pt) >= 32 and pt[:32] == hashlib.sha256(host.encode()).digest():
+            pt = pt[32:]                  # strip M104+ domain-bind hash
+        try: return pt.decode('utf-8')
+        except Exception: return None
+    tmp = tempfile.mktemp(suffix='.cookies')   # copy so a running browser's lock doesn't block us
+    shutil.copy2(db_path, tmp)
+    out, skipped = [], 0
+    try:
+        con = sqlite3.connect(f'file:{tmp}?mode=ro&immutable=1', uri=True)
+        rows = con.execute('select host_key,name,encrypted_value,value,path,is_secure,'
+                            'is_httponly,expires_utc,samesite from cookies').fetchall()
+        con.close()
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+    ss_map = {0: 'None', 1: 'Lax', 2: 'Strict'}
+    for host, name, enc, plain, path, sec, http, exp, ss in rows:
+        val = dec(enc, host) if enc else plain
+        if val is None:
+            skipped += 1
+            continue
+        c = {'name': name, 'value': val, 'domain': host, 'path': path or '/',
+             'secure': bool(sec), 'httpOnly': bool(http)}
+        if exp:                           # chrome epoch (1601) micros -> unix seconds
+            c['expires'] = exp / 1e6 - 11644473600
+        if ss in ss_map and sec:          # SameSite=None requires Secure; only set when valid
+            c['sameSite'] = ss_map[ss]
+        out.append(c)
+    return out, skipped
+
+def c_web_login(a):
+    if not a.yes:
+        print(LOGIN_WARNING.format(browser=a.browser, port=a.port))
+        return
+    kind, ref = _resolve_browser(a.browser)
+    src = _real_profile_dir(kind, ref, a.browser)
+    db = _cookies_db(src, a.profile)
+    if not db:
+        sys.exit(f'no cookie DB under {src} — is {a.browser} set up / logged in?')
+    cookies, skipped = _read_decrypt_cookies(db)
+    sess = _Sess(_pick(a.port, a.tab)['webSocketDebuggerUrl'])
+    ok = fail = 0
+    try:
+        sess.call('Network.enable')
+        for c in cookies:
+            try:
+                r = sess.call('Network.setCookie', **c)
+                ok += 1 if r.get('success', True) else 0
+                fail += 0 if r.get('success', True) else 1
+            except Exception:
+                fail += 1
+    finally:
+        sess.close()
+    print(f'logged in: injected {ok} cookies ({fail} rejected, {skipped} undecryptable) from {a.browser} '
+          f'-> debug :{a.port}. Reload the page (seehand web-load URL) to see the signed-in session.')
+
+def c_web_launch(a):
+    kind, ref = _resolve_browser(a.browser)
+    # profile must live in a flatpak-accessible dir (xdg-documents); fine for native too
+    prof = os.path.expanduser(f'~/Documents/seehand-{a.browser}-debug')
+    if not a.keep:  # tear down any stale debug instance so the port is free
+        _free_port(a.port, f'cc-{a.browser}-debug')
+    os.makedirs(prof, exist_ok=True)
+    flags = [f'--remote-debugging-port={a.port}', '--remote-allow-origins=*',
+             f'--user-data-dir={prof}', '--no-first-run', '--no-default-browser-check']
+    cmd = (['flatpak', 'run', ref] if kind == 'flatpak' else [ref]) + flags + ([a.url] if a.url else ['about:blank'])
+    env = dict(os.environ); env.setdefault('DISPLAY', ':0')
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+    print(f'launched {kind}:{ref} pid {p.pid} debug-port {a.port} (wait ~3s, then: seehand web-tabs)')
+
+def c_web_tabs(a):
+    for t in _pages(a.port):
+        print(f"{t['id']} {t.get('title','')[:50]!r} {t.get('url','')[:80]}")
+
+def c_web_eval(a):
+    s = _Sess(_pick(a.port, a.tab)['webSocketDebuggerUrl'])
+    try:
+        r = s.call('Runtime.evaluate', expression=a.js, returnByValue=True, awaitPromise=True)
+        if 'exceptionDetails' in r:
+            print('EXCEPTION:', r['exceptionDetails'].get('text'), r.get('result', {}).get('description', ''))
+        else:
+            v = r.get('result', {})
+            print(v.get('value', v.get('description', '<undefined>')))
+    finally: s.close()
+
+def c_web_log(a):
+    s = _Sess(_pick(a.port, a.tab)['webSocketDebuggerUrl'])
+    try:
+        s.call('Runtime.enable');
+        try: s.call('Log.enable')
+        except Exception: pass
+        evs = s.listen(a.ms / 1000.0)
+        rows = []
+        for e in evs:
+            m = e.get('method'); p = e.get('params', {})
+            if m == 'Runtime.consoleAPICalled':
+                lvl = p.get('type', 'log')
+                txt = ' '.join(str(x.get('value', x.get('description', ''))) for x in p.get('args', []))
+                rows.append((lvl, txt))
+            elif m == 'Runtime.exceptionThrown':
+                rows.append(('error', p.get('exceptionDetails', {}).get('text', 'exception')))
+            elif m == 'Log.entryAdded':
+                en = p.get('entry', {}); rows.append((en.get('level', 'log'), en.get('text', '')))
+        if not a.all:
+            rows = [r for r in rows if r[0] in ('error', 'warning', 'assert')]
+        seen = set(); rows = [r for r in rows if not (r in seen or seen.add(r))]
+        for lvl, txt in rows[:80]: print(f'{lvl.upper():7} {txt[:200]}')
+        if not rows: print('(no messages)')
+    finally: s.close()
+
+def c_web_net(a):
+    s = _Sess(_pick(a.port, a.tab)['webSocketDebuggerUrl'])
+    try:
+        s.call('Network.enable')
+        evs = s.listen(a.ms / 1000.0)
+        reqs = {}
+        for e in evs:
+            m = e.get('method'); p = e.get('params', {})
+            if m == 'Network.requestWillBeSent':
+                reqs[p['requestId']] = {'url': p['request']['url'], 'status': None, 'fail': None}
+            elif m == 'Network.responseReceived':
+                r = reqs.get(p['requestId'])
+                if r: r['status'] = p['response']['status']
+            elif m == 'Network.loadingFailed':
+                r = reqs.get(p['requestId'])
+                if r: r['fail'] = p.get('errorText', 'failed')
+        rows = list(reqs.values())
+        if not a.all:
+            rows = [r for r in rows if r['fail'] or (r['status'] and r['status'] >= 400)]
+        for r in rows[:80]:
+            tag = r['fail'] or r['status']
+            print(f"{tag} {r['url'][:140]}")
+        if not rows: print('(no failed requests)' if not a.all else '(no requests)')
+    finally: s.close()
+
+def c_web_load(a):
+    """Navigate to URL and capture console + network during the full load — the debug workhorse."""
+    s = _Sess(_pick(a.port, a.tab)['webSocketDebuggerUrl'])
+    try:
+        s.call('Page.enable'); s.call('Runtime.enable'); s.call('Network.enable')
+        try: s.call('Log.enable')
+        except Exception: pass
+        s.call('Page.navigate', url=a.url)
+        evs = s.listen(a.ms / 1000.0)
+        console, reqs = [], {}
+        for e in evs:
+            m = e.get('method'); p = e.get('params', {})
+            if m == 'Runtime.consoleAPICalled':
+                lvl = p.get('type', 'log')
+                if a.all or lvl in ('error', 'warning', 'assert'):
+                    console.append((lvl, ' '.join(str(x.get('value', x.get('description', ''))) for x in p.get('args', []))))
+            elif m == 'Runtime.exceptionThrown':
+                console.append(('error', p.get('exceptionDetails', {}).get('text', 'exception')))
+            elif m == 'Log.entryAdded':
+                en = p.get('entry', {}); lvl = en.get('level', 'log')
+                if a.all or lvl in ('error', 'warning'):
+                    console.append((lvl, en.get('text', '')))
+            elif m == 'Network.requestWillBeSent':
+                reqs[p['requestId']] = {'url': p['request']['url'], 'status': None, 'fail': None}
+            elif m == 'Network.responseReceived':
+                r = reqs.get(p['requestId'])
+                if r: r['status'] = p['response']['status']
+            elif m == 'Network.loadingFailed':
+                r = reqs.get(p['requestId'])
+                if r: r['fail'] = p.get('errorText', 'failed')
+        title = s.call('Runtime.evaluate', expression='document.title', returnByValue=True).get('result', {}).get('value', '')
+        seen = set(); console = [c for c in console if not (c in seen or seen.add(c))]
+        print(f'LOADED {a.url!r} title={title!r}')
+        print(f'-- console ({len(console)}) --')
+        for lvl, txt in console[:60]: print(f'{lvl.upper():7} {txt[:200]}')
+        bad = [r for r in reqs.values() if r['fail'] or (r['status'] and r['status'] >= 400)]
+        rows = list(reqs.values()) if a.all else bad
+        print(f'-- network ({len(reqs)} reqs, {len(bad)} failed) --')
+        for r in rows[:60]: print(f"{r['fail'] or r['status']} {r['url'][:140]}")
+    finally: s.close()
+
+def c_web_dom(a):
+    s = _Sess(_pick(a.port, a.tab)['webSocketDebuggerUrl'])
+    try:
+        if a.sel:
+            js = ("Array.from(document.querySelectorAll(%r)).slice(0,40)"
+                  ".map(e=>e.outerHTML.slice(0,200)).join('\\n')" % a.sel)
+        else:
+            js = "document.documentElement.outerHTML.slice(0,4000)"
+        r = s.call('Runtime.evaluate', expression=js, returnByValue=True)
+        print(r.get('result', {}).get('value', '(none)'))
+    finally: s.close()
+
+def c_web_shot(a):
+    s = _Sess(_pick(a.port, a.tab)['webSocketDebuggerUrl'])
+    try:
+        import base64
+        r = s.call('Page.captureScreenshot')
+        out = a.out or os.path.join(SHOTS, f'web-{int(time.time())}.png')
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'wb') as f: f.write(base64.b64decode(r['data']))
+        print(out)
+    finally: s.close()
+
+# ----------------------------------------------------------------------------- cli
+def main():
+    p = argparse.ArgumentParser(prog='seehand', description='seehand')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    def add(name, fn, args=()):
+        s = sub.add_parser(name)
+        for a_, kw in args: s.add_argument(*a_, **kw)
+        s.set_defaults(fn=fn); return s
+
+    add('apps', c_apps)
+    add('tree', c_tree, [(('--app',), {}), (('--depth',), {'type': int, 'default': 14}), (('--all',), {'action': 'store_true'})])
+    add('find', c_find, [(('text',), {}), (('--app',), {}), (('--role',), {})])
+    add('do', c_do, [(('path',), {'nargs': '?'}), (('--name',), {}), (('--action',), {}), (('--app',), {})])
+    add('set', c_set, [(('path',), {'nargs': '?'}), (('value',), {}), (('--name',), {}), (('--app',), {})])
+    add('info', c_info, [(('path',), {})])
+
+    add('shot', c_shot, [(('--scale',), {'type': float, 'default': 1.0}), (('--region',), {'type': int, 'nargs': 4}), (('--out',), {})])
+    add('move', c_move, [(('x',), {'type': int}), (('y',), {'type': int})])
+    add('click', c_click, [(('x',), {'type': int, 'nargs': '?'}), (('y',), {'type': int, 'nargs': '?'}), (('-b',), {'default': 'l'}), (('-d',), {'action': 'store_true'})])
+    add('drag', c_drag, [(('x1',), {'type': int}), (('y1',), {'type': int}), (('x2',), {'type': int}), (('y2',), {'type': int}), (('-b',), {'default': 'l'})])
+    add('scroll', c_scroll, [(('dy',), {'type': int}), (('--dx',), {'type': int, 'default': 0})])
+    add('type', c_type, [(('text',), {})])
+    add('key', c_key, [(('combos',), {'nargs': '+'})])
+    add('run', c_run, [(('cmd',), {})])
+
+    add('web-launch', c_web_launch, [(('url',), {'nargs': '?'}), (('--browser',), {'default': 'chrome'}), (('--keep',), {'action': 'store_true'}), (('--port',), {'type': int, 'default': 9222})])
+    add('web-login', c_web_login, [(('--browser',), {'default': 'chrome'}), (('--profile',), {'default': 'Default'}), (('--yes',), {'action': 'store_true'}), (('--tab',), {}), (('--port',), {'type': int, 'default': 9222})])
+    add('web-kill', c_web_kill, [(('--browser',), {'default': 'chrome'}), (('--port',), {'type': int, 'default': 9222})])
+    add('web-tabs', c_web_tabs, [(('--port',), {'type': int, 'default': 9222})])
+    add('web-load', c_web_load, [(('url',), {}), (('--ms',), {'type': int, 'default': 4000}), (('--tab',), {}), (('--all',), {'action': 'store_true'}), (('--port',), {'type': int, 'default': 9222})])
+    add('web-eval', c_web_eval, [(('js',), {}), (('--tab',), {}), (('--port',), {'type': int, 'default': 9222})])
+    add('web-log', c_web_log, [(('--ms',), {'type': int, 'default': 2500}), (('--tab',), {}), (('--all',), {'action': 'store_true'}), (('--port',), {'type': int, 'default': 9222})])
+    add('web-net', c_web_net, [(('--ms',), {'type': int, 'default': 2500}), (('--tab',), {}), (('--all',), {'action': 'store_true'}), (('--port',), {'type': int, 'default': 9222})])
+    add('web-dom', c_web_dom, [(('--sel',), {}), (('--tab',), {}), (('--port',), {'type': int, 'default': 9222})])
+    add('web-shot', c_web_shot, [(('--out',), {}), (('--tab',), {}), (('--port',), {'type': int, 'default': 9222})])
+
+    sub.add_parser('help').set_defaults(fn=lambda a: print(__doc__))
+    if not os.environ.get('DISPLAY'): os.environ['DISPLAY'] = ':0'
+    a = p.parse_args()
+    try:
+        a.fn(a)
+    except ImportError as e:
+        sys.exit(f'seehand: missing module {e.name}. Run ./install.sh or see README.')
+
+if __name__ == '__main__':
+    main()

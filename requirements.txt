@@ -1,0 +1,6 @@
+pynput
+mss
+pillow
+websocket-client
+requests
+cryptography
