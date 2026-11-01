@@ -67,6 +67,15 @@ seehand web-kill
 
 `web-launch` frees the port, works with flatpak Chrome (profile in `~/Documents/seehand-chrome-debug`, which the sandbox can see) and starts a separate profile, so your real browser is never touched.
 
+### Without a window: `--headless`
+
+```sh
+seehand web-launch --headless "https://www.google.com/search?q=weather"
+seehand web-eval "document.title"
+```
+
+No window appears anywhere, so the agent can browse while you keep working. The user agent is set to the normal Chrome one, so sites treat it like a regular browser. Combine with `web-login --yes` to browse signed in as you.
+
 ### Acting as you: `web-login`
 
 ```sh
@@ -78,6 +87,24 @@ It reads the cookies of your own browser profile, decrypts them and injects them
 
 **This is sensitive.** Anything that can reach port 9222 while the debug browser runs can act as you. Only use it on your own machine and account, and run `seehand web-kill` when done. Only `v10` cookies (Chrome's basic key, used when no keyring is running) can be decrypted; with a working GNOME Keyring or KWallet, cookies are `v11` and are skipped.
 
+## Offscreen desktop
+
+For desktop apps that should run without touching your screen, start a wlroots compositor with no display:
+
+```sh
+seehand session start                # sway, gluewc, dwl, labwc or river; or --compositor CMD
+seehand off run "pavucontrol"        # any command, prefixed with off, runs in that session
+seehand off tree --app pavucontrol
+seehand off click 400 300
+seehand off type "hello"
+seehand off shot --scale 0.5
+seehand session stop
+```
+
+Your own mouse, keyboard and windows are never touched. `seehand off web-launch` always starts Chrome headless (windowed Chrome crashes in a screenless compositor).
+
+dwl-based compositors (dwl, mango, gluewc before 2026-11) only advertise a keyboard when a physical one exists, so apps in the session never receive typed keys. The fix is one line in `virtualkeyboard()`: `wlr_seat_set_capabilities(seat, seat->capabilities | WL_SEAT_CAPABILITY_KEYBOARD);`. sway does not need it.
+
 ## For agents
 
 Put this in your agent instructions:
@@ -85,8 +112,9 @@ Put this in your agent instructions:
 1. Read with `tree`/`find` before you screenshot. Text is exact and costs a fraction of an image.
 2. If you must screenshot, use `--scale 0.4` or `--region`.
 3. Act through widgets (`do`, `set`) before raw `click`/`type`; they do not move the user's cursor.
-4. For websites use `web-load`/`web-eval`, not desktop screenshots.
-5. Confirm results by reading a value back, not by looking at a picture.
+4. For websites use `web-load`/`web-eval`, not desktop screenshots. Use `--headless` unless the user wants to watch.
+5. To avoid disturbing the user, run desktop work in `seehand session start` + `seehand off ...`.
+6. Confirm results by reading a value back, not by looking at a picture.
 
 ## Notes
 
